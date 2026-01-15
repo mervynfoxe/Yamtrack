@@ -4,6 +4,7 @@ from collections import defaultdict
 
 import requests
 from django.conf import settings
+from django.db.models import Q
 from django.urls import reverse
 from django.utils.dateparse import parse_datetime
 from django_celery_beat.models import PeriodicTask
@@ -13,6 +14,7 @@ from app.models import MediaTypes, Sources, Status
 from app.providers import services
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
+from lists.models import CustomList
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +189,7 @@ class TraktImporter:
         self.process_watchlist()
         self.process_ratings()
         self.process_comments()
+        self.process_user_lists()
 
         helpers.cleanup_existing_media(self.to_delete, self.user)
         helpers.bulk_create_media(self.bulk_media, self.user)
@@ -605,8 +608,72 @@ class TraktImporter:
                 msg = f"Error processing comment entry: {entry}"
                 raise MediaImportUnexpectedError(msg) from e
 
-    def _process_generic_entry(self, entry, entry_type, attribute_updates=None):
-        """Process a generic entry (watchlist, rating, or comment)."""
+    def process_user_lists(self):
+        """Process custom user lists from Trakt."""
+        logger.info("Importing user lists for user %s", self.username)
+        lists_endpoint = f"{self.user_base_url}/lists"
+        lists_data = self._make_api_request(lists_endpoint)
+
+        for user_list in lists_data:
+            logger.info("Processing Trakt list: %s", user_list["name"])
+            list_endpoint = f"{self.user_base_url}/lists/{user_list["ids"]["slug"]}/items"
+            list_data = self._make_api_request(list_endpoint)
+
+            local_list = self._get_or_create_custom_list(
+                user_list["name"],
+                user_list["description"],
+                True
+            )
+            if len(list_data) <= 0 or not local_list:
+                continue
+
+            for entry in list_data:
+                try:
+                    self._process_generic_entry(
+                        entry,
+                        f"custom list {local_list.name}",
+                        {},
+                        local_list,
+                    )
+                except Exception as e:
+                    msg = f"Error processing custom list entry for {local_list.name}: {entry}"
+                    raise MediaImportUnexpectedError(msg) from e
+
+    def _get_or_create_custom_list(
+        self,
+        list_name,
+        list_description="",
+        create_nonexistent=False
+    ):
+        """Find a custom list owned by the user, or create one"""
+        try:
+            custom_list = CustomList.objects.get(
+                Q(owner=self.user) & Q(name=list_name),
+            )
+        except CustomList.DoesNotExist:
+            if create_nonexistent == True:
+                logger.info("Creating custom list: %s", list_name)
+                custom_list = CustomList.objects.create(
+                    name=list_name,
+                    description=list_description,
+                    owner=self.user
+                )
+            else:
+                logger.debug("No local list matching: %s", list_name)
+                custom_list = None
+        else:
+            logger.debug("Local list %s exists", custom_list.name)
+        finally:
+            return custom_list
+
+    def _process_generic_entry(
+        self,
+        entry,
+        entry_type,
+        attribute_updates=None,
+        custom_list=None,
+    ):
+        """Process a generic entry (watchlist, rating, comment, or custom list addition)."""
         if entry["type"] == "movie":
             logger.info(
                 "Processing movie %s for %s",
@@ -619,6 +686,8 @@ class TraktImporter:
                 MediaTypes.MOVIE.value,
                 app.models.Movie,
                 attribute_updates or {},
+                None,
+                custom_list,
             )
         elif entry["type"] == "show":
             logger.info(
@@ -632,6 +701,8 @@ class TraktImporter:
                 MediaTypes.TV.value,
                 app.models.TV,
                 attribute_updates or {},
+                None,
+                custom_list,
             )
         elif entry["type"] == "season":
             logger.info(
@@ -647,6 +718,7 @@ class TraktImporter:
                 app.models.Season,
                 attribute_updates or {},
                 entry["season"]["number"],
+                custom_list,
             )
 
     def _process_media_item(
@@ -657,6 +729,7 @@ class TraktImporter:
         model_class,
         defaults=None,
         season_number=None,
+        custom_list=None,
     ):
         """Process media items for watchlist, ratings, and comments."""
         tmdb_id = self._get_tmdb_id(media_data)
@@ -714,6 +787,9 @@ class TraktImporter:
             media_obj._history_date = updated_at
             self.bulk_media[media_type].append(media_obj)
             self.media_instances[media_type][key] = [media_obj]
+
+        if custom_list:
+            custom_list.items.add(item)
 
     def _get_tv_obj(self, tmdb_id, media_data, updated_at):
         """Get or create a TV object for the given season."""
